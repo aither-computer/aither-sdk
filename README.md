@@ -1,6 +1,6 @@
 # aither
 
-Python SDK for the [Aither](https://aither.computer) platform - contextual intelligence and model observability.
+Python SDK for the [aither](https://aither.computer) platform - contextual intelligence and model observability.
 
 ## Features
 
