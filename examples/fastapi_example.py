@@ -6,7 +6,7 @@ Predictions are logged without blocking request handling.
 Run with: uvicorn fastapi_example:app --reload
 
 Requirements:
-    pip install fastapi uvicorn scikit-learn
+    pip install fastapi uvicorn
 """
 
 from typing import Any
@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 # Initialize Aither SDK once at startup
 aither.init(
-    api_key="ak_your_api_key_here",
+    api_key="aith_your_api_key_here",
     flush_interval=1.0,  # Flush every 1 second
     batch_size=100,  # Up to 100 predictions per batch
 )
@@ -36,6 +36,14 @@ class PredictionResponse(BaseModel):
 
     sentiment: str
     confidence: float
+    trace_id: str
+
+
+class LabelRequest(BaseModel):
+    """Request model for ground truth labels."""
+
+    trace_id: str
+    actual_sentiment: str
 
 
 # Simulate a trained model (replace with your actual model)
@@ -57,25 +65,40 @@ async def predict(request: PredictionRequest) -> dict[str, Any]:
     # Make prediction
     sentiment, confidence = predict_sentiment(request.text)
 
-    # Log to Aither (non-blocking - returns instantly)
-    aither.log_prediction(
-        model_id="sentiment-api-v1",
-        prediction=sentiment,
+    # Log to Aither (non-blocking - returns trace_id for label correlation)
+    trace_id = aither.log_prediction(
+        model_name="sentiment-api-v1",
         features={
             "text_length": len(request.text),
             "word_count": len(request.text.split()),
         },
-        metadata={
-            "user_id": request.user_id,
-            "confidence": confidence,
-        },
+        prediction=sentiment,
+        # Optional: add probability and class information
+        probabilities=[1 - confidence, confidence]
+        if sentiment == "positive"
+        else [confidence, 1 - confidence],
+        classes=["negative", "positive"],
+        environment="production",
+        user_id=request.user_id,
     )
 
-    # Return prediction immediately
+    # Return prediction immediately with trace_id
     return {
         "sentiment": sentiment,
         "confidence": confidence,
+        "trace_id": trace_id,
     }
+
+
+@app.post("/label")
+async def label(request: LabelRequest) -> dict[str, str]:
+    """Submit ground truth label for a previous prediction.
+
+    Use the trace_id from the prediction response to correlate
+    the ground truth with the original prediction.
+    """
+    aither.log_label(trace_id=request.trace_id, label=request.actual_sentiment)
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -98,10 +121,15 @@ async def shutdown_event():
 # 1. Start the server:
 #    uvicorn fastapi_example:app --reload
 #
-# 2. Make a request:
+# 2. Make a prediction:
 #    curl -X POST http://localhost:8000/predict \
 #      -H "Content-Type: application/json" \
 #      -d '{"text": "This product is amazing!", "user_id": "user_123"}'
 #
-# 3. The response is instant, logging happens in background:
-#    {"sentiment": "negative", "confidence": 0.84}
+# 3. Response includes trace_id for ground truth correlation:
+#    {"sentiment": "negative", "confidence": 0.84, "trace_id": "abc123..."}
+#
+# 4. Later, submit ground truth:
+#    curl -X POST http://localhost:8000/label \
+#      -H "Content-Type: application/json" \
+#      -d '{"trace_id": "abc123...", "actual_sentiment": "positive"}'

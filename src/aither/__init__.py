@@ -6,8 +6,8 @@ from typing import Any
 
 from aither.client import AitherClient
 
-__version__ = "0.1.0"
-__all__ = ["AitherClient", "init", "log_prediction", "flush", "close"]
+__version__ = "0.2.0"
+__all__ = ["AitherClient", "init", "log_prediction", "log_label", "flush", "close"]
 
 _client: AitherClient | None = None
 
@@ -44,40 +44,72 @@ def _get_client() -> AitherClient:
 
 
 def log_prediction(
-    model_id: str,
+    model_name: str,
+    features: dict[str, Any],
     prediction: Any,
-    features: dict[str, Any] | None = None,
-    metadata: dict[str, Any] | None = None,
-) -> None:
+    *,
+    version: str | None = None,
+    probabilities: list[float] | None = None,
+    classes: list[str] | None = None,
+    environment: str | None = None,
+    request_id: str | None = None,
+    user_id: str | None = None,
+) -> str:
     """Log a model prediction using the global client (non-blocking).
 
-    Predictions are queued and sent asynchronously in the background.
-    This function returns immediately without waiting for the API response.
+    Predictions are queued and sent asynchronously using OTLP format.
+    Returns a trace_id that can be used to correlate ground truth labels.
 
     Args:
-        model_id: Identifier for the model.
-        prediction: The prediction value.
+        model_name: Identifier for the model (e.g., "fraud_detector").
         features: Input features used for the prediction.
-        metadata: Additional context or metadata.
+        prediction: The prediction value.
+        version: Model version (e.g., "1.2.3", git sha).
+        probabilities: Class probabilities (for classification).
+        classes: Class labels corresponding to probabilities.
+        environment: Deployment environment (e.g., "production").
+        request_id: Unique request identifier.
+        user_id: User/customer identifier (anonymized).
+
+    Returns:
+        trace_id: Hex-encoded trace ID for label correlation.
     """
-    _get_client().log_prediction(
-        model_id=model_id,
-        prediction=prediction,
+    return _get_client().log_prediction(
+        model_name=model_name,
         features=features,
-        metadata=metadata,
+        prediction=prediction,
+        version=version,
+        probabilities=probabilities,
+        classes=classes,
+        environment=environment,
+        request_id=request_id,
+        user_id=user_id,
     )
 
 
-def flush() -> None:
-    """Force immediate flush of queued predictions (blocking).
+def log_label(trace_id: str, label: Any) -> None:
+    """Log ground truth label for a previous prediction (non-blocking).
 
-    Useful for ensuring predictions are sent before shutdown or in tests.
+    Use the trace_id returned from log_prediction() to correlate
+    the ground truth with the original prediction.
+
+    Args:
+        trace_id: The trace_id returned from log_prediction().
+        label: The actual outcome/ground truth value.
+    """
+    _get_client().log_label(trace_id=trace_id, label=label)
+
+
+def flush() -> None:
+    """Force immediate flush of queued predictions and labels (blocking).
+
+    Useful for ensuring data is sent before shutdown or in tests.
     """
     _get_client().flush()
 
 
 def close() -> None:
-    """Close the global client and flush remaining predictions."""
+    """Close the global client and flush remaining data."""
     global _client
     if _client is not None:
         _client.close()

@@ -1,12 +1,15 @@
-"""Aither client implementation."""
+"""Aither client implementation using OTLP for model prediction logging."""
 
 from __future__ import annotations
 
-import asyncio
 import atexit
+import json
 import os
+import secrets
 import threading
+import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -16,12 +19,38 @@ DEFAULT_FLUSH_INTERVAL = 1.0  # seconds
 DEFAULT_BATCH_SIZE = 100
 
 
+@dataclass
+class PredictionSpan:
+    """Internal representation of a prediction span."""
+
+    trace_id: bytes
+    span_id: bytes
+    model_name: str
+    features: dict[str, Any]
+    prediction: Any
+    version: str | None = None
+    probabilities: list[float] | None = None
+    classes: list[str] | None = None
+    environment: str | None = None
+    request_id: str | None = None
+    user_id: str | None = None
+    start_time_ns: int = 0
+    end_time_ns: int = 0
+
+
+@dataclass
+class LabelUpdate:
+    """Internal representation of a label update."""
+
+    trace_id: str
+    label: Any
+
+
 class AitherClient:
     """Client for the Aither platform API.
 
-    Uses async httpx internally with a background worker for non-blocking operation.
-    The API is synchronous for ease of use - predictions are queued and flushed
-    asynchronously in the background.
+    Logs ML model predictions using OTLP (OpenTelemetry Protocol) format.
+    Predictions are sent as spans with ml.* attributes.
     """
 
     def __init__(
@@ -52,145 +81,357 @@ class AitherClient:
         self.batch_size = batch_size
         self.enable_background = enable_background
 
-        # Thread-safe queue for predictions
-        self._queue: deque[dict[str, Any]] = deque()
+        # Thread-safe queue for predictions and labels
+        self._prediction_queue: deque[PredictionSpan] = deque()
+        self._label_queue: deque[LabelUpdate] = deque()
         self._queue_lock = threading.Lock()
 
         # Background worker management
         self._worker_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Start background worker
         if self.enable_background:
             self._start_worker()
             atexit.register(self.close)
 
-    def _build_headers(self) -> dict[str, str]:
+    def _build_headers(
+        self, content_type: str = "application/x-protobuf"
+    ) -> dict[str, str]:
         """Build request headers."""
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": content_type}
         if self.api_key:
-            headers["X-API-Key"] = self.api_key
+            headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+    def _generate_trace_id(self) -> bytes:
+        """Generate a random 128-bit trace ID."""
+        return secrets.token_bytes(16)
+
+    def _generate_span_id(self) -> bytes:
+        """Generate a random 64-bit span ID."""
+        return secrets.token_bytes(8)
 
     def _start_worker(self) -> None:
         """Start the background worker thread."""
-        self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
-    def _run_worker(self) -> None:
-        """Worker thread that runs async event loop."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._worker_loop())
-        finally:
-            self._loop.close()
+    def _worker_loop(self) -> None:
+        """Worker thread that periodically flushes the queues."""
+        while not self._stop_event.is_set():
+            try:
+                self._flush_predictions()
+                self._flush_labels()
+            except Exception as e:
+                # Log errors but keep the worker running
+                print(f"Error flushing queue: {e}")
 
-    async def _worker_loop(self) -> None:
-        """Async worker loop that periodically flushes the queue."""
-        async with httpx.AsyncClient(
-            base_url=self.endpoint,
-            timeout=self.timeout,
-            headers=self._build_headers(),
-        ) as client:
-            while not self._stop_event.is_set():
-                try:
-                    await self._flush_queue(client)
-                except Exception as e:
-                    # Log errors but keep the worker running
-                    # TODO: Add proper logging
-                    print(f"Error flushing queue: {e}")
+            # Wait for flush interval or stop event
+            self._stop_event.wait(timeout=self.flush_interval)
 
-                # Wait for flush interval or stop event
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(asyncio.create_task(asyncio.sleep(float('inf')))),
-                        timeout=self.flush_interval
+    def _build_otlp_request(self, spans: list[PredictionSpan]) -> bytes:
+        """Build OTLP ExportTraceServiceRequest protobuf."""
+        # Import here to avoid loading protobuf at module level
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+            ExportTraceServiceRequest,
+        )
+        from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+        from opentelemetry.proto.trace.v1.trace_pb2 import (
+            ResourceSpans,
+            ScopeSpans,
+            Span,
+        )
+
+        otlp_spans = []
+        for ps in spans:
+            attributes = [
+                KeyValue(
+                    key="ml.model.name", value=AnyValue(string_value=ps.model_name)
+                ),
+                KeyValue(
+                    key="ml.features",
+                    value=AnyValue(string_value=json.dumps(ps.features)),
+                ),
+                KeyValue(
+                    key="ml.prediction",
+                    value=AnyValue(string_value=json.dumps(ps.prediction)),
+                ),
+            ]
+
+            if ps.version:
+                attributes.append(
+                    KeyValue(
+                        key="ml.model.version", value=AnyValue(string_value=ps.version)
                     )
-                except asyncio.TimeoutError:
-                    pass  # Normal timeout, continue to next flush
+                )
+            if ps.probabilities:
+                attributes.append(
+                    KeyValue(
+                        key="ml.prediction.probabilities",
+                        value=AnyValue(string_value=json.dumps(ps.probabilities)),
+                    )
+                )
+            if ps.classes:
+                attributes.append(
+                    KeyValue(
+                        key="ml.prediction.classes",
+                        value=AnyValue(string_value=json.dumps(ps.classes)),
+                    )
+                )
+            if ps.environment:
+                attributes.append(
+                    KeyValue(
+                        key="ml.environment",
+                        value=AnyValue(string_value=ps.environment),
+                    )
+                )
+            if ps.request_id:
+                attributes.append(
+                    KeyValue(
+                        key="ml.request_id", value=AnyValue(string_value=ps.request_id)
+                    )
+                )
+            if ps.user_id:
+                attributes.append(
+                    KeyValue(key="ml.user_id", value=AnyValue(string_value=ps.user_id))
+                )
 
-    async def _flush_queue(self, client: httpx.AsyncClient) -> None:
+            span = Span(
+                trace_id=ps.trace_id,
+                span_id=ps.span_id,
+                name=ps.model_name,
+                start_time_unix_nano=ps.start_time_ns,
+                end_time_unix_nano=ps.end_time_ns,
+                attributes=attributes,
+            )
+            otlp_spans.append(span)
+
+        request = ExportTraceServiceRequest(
+            resource_spans=[ResourceSpans(scope_spans=[ScopeSpans(spans=otlp_spans)])]
+        )
+
+        return request.SerializeToString()
+
+    def _flush_predictions(self) -> None:
         """Flush predictions from queue to API."""
-        predictions_to_send = []
+        spans_to_send: list[PredictionSpan] = []
 
         with self._queue_lock:
-            # Take up to batch_size predictions from queue
-            while self._queue and len(predictions_to_send) < self.batch_size:
-                predictions_to_send.append(self._queue.popleft())
+            while self._prediction_queue and len(spans_to_send) < self.batch_size:
+                spans_to_send.append(self._prediction_queue.popleft())
 
-        if not predictions_to_send:
+        if not spans_to_send:
             return
 
-        # Send batch if we have multiple predictions, otherwise send single
-        if len(predictions_to_send) == 1:
-            await client.post("/v1/predictions", json=predictions_to_send[0])
-        else:
-            # Use batch endpoint if available
-            await client.post("/v1/predictions/batch", json={"predictions": predictions_to_send})
+        # Build and send OTLP request
+        payload = self._build_otlp_request(spans_to_send)
+
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.post(
+                f"{self.endpoint}/v1/traces",
+                content=payload,
+                headers=self._build_headers("application/x-protobuf"),
+            )
+            response.raise_for_status()
+
+    def _flush_labels(self) -> None:
+        """Flush label updates from queue to API."""
+        labels_to_send: list[LabelUpdate] = []
+
+        with self._queue_lock:
+            while self._label_queue and len(labels_to_send) < self.batch_size:
+                labels_to_send.append(self._label_queue.popleft())
+
+        if not labels_to_send:
+            return
+
+        # Build OTLP request with label spans
+        # Import here to avoid loading protobuf at module level
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+            ExportTraceServiceRequest,
+        )
+        from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+        from opentelemetry.proto.trace.v1.trace_pb2 import (
+            ResourceSpans,
+            ScopeSpans,
+            Span,
+        )
+
+        otlp_spans = []
+        now_ns = time.time_ns()
+
+        for label in labels_to_send:
+            # Decode trace_id from hex string
+            trace_id = bytes.fromhex(label.trace_id)
+            span_id = self._generate_span_id()
+
+            attributes = [
+                KeyValue(
+                    key="ml.label", value=AnyValue(string_value=json.dumps(label.label))
+                ),
+            ]
+
+            span = Span(
+                trace_id=trace_id,
+                span_id=span_id,
+                name="label_update",
+                start_time_unix_nano=now_ns,
+                end_time_unix_nano=now_ns,
+                attributes=attributes,
+            )
+            otlp_spans.append(span)
+
+        request = ExportTraceServiceRequest(
+            resource_spans=[ResourceSpans(scope_spans=[ScopeSpans(spans=otlp_spans)])]
+        )
+
+        payload = request.SerializeToString()
+
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.post(
+                f"{self.endpoint}/v1/traces",
+                content=payload,
+                headers=self._build_headers("application/x-protobuf"),
+            )
+            response.raise_for_status()
 
     def log_prediction(
         self,
-        model_id: str,
+        model_name: str,
+        features: dict[str, Any],
         prediction: Any,
-        features: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
+        *,
+        version: str | None = None,
+        probabilities: list[float] | None = None,
+        classes: list[str] | None = None,
+        environment: str | None = None,
+        request_id: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
         """Log a model prediction (non-blocking).
 
+        Predictions are queued and sent asynchronously using OTLP format.
+        Returns a trace_id that can be used to correlate ground truth labels.
+
         Args:
-            model_id: Identifier for the model.
-            prediction: The prediction value.
+            model_name: Identifier for the model (e.g., "fraud_detector").
             features: Input features used for the prediction.
-            metadata: Additional context or metadata.
+            prediction: The prediction value.
+            version: Model version (e.g., "1.2.3", git sha).
+            probabilities: Class probabilities (for classification).
+            classes: Class labels corresponding to probabilities.
+            environment: Deployment environment (e.g., "production").
+            request_id: Unique request identifier.
+            user_id: User/customer identifier (anonymized).
+
+        Returns:
+            trace_id: Hex-encoded trace ID for label correlation.
         """
-        payload = {
-            "model_id": model_id,
-            "prediction": prediction,
-        }
-        if features is not None:
-            payload["features"] = features
-        if metadata is not None:
-            payload["metadata"] = metadata
+        trace_id = self._generate_trace_id()
+        span_id = self._generate_span_id()
+        now_ns = time.time_ns()
+
+        span = PredictionSpan(
+            trace_id=trace_id,
+            span_id=span_id,
+            model_name=model_name,
+            features=features,
+            prediction=prediction,
+            version=version,
+            probabilities=probabilities,
+            classes=classes,
+            environment=environment,
+            request_id=request_id,
+            user_id=user_id,
+            start_time_ns=now_ns,
+            end_time_ns=now_ns,
+        )
+
+        trace_id_hex = trace_id.hex()
 
         if self.enable_background:
-            # Add to queue for async processing
             with self._queue_lock:
-                self._queue.append(payload)
+                self._prediction_queue.append(span)
         else:
             # Immediate mode: block and send synchronously
-            with httpx.Client(
-                base_url=self.endpoint,
-                timeout=self.timeout,
-                headers=self._build_headers(),
-            ) as client:
-                response = client.post("/v1/predictions", json=payload)
+            payload = self._build_otlp_request([span])
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(
+                    f"{self.endpoint}/v1/traces",
+                    content=payload,
+                    headers=self._build_headers("application/x-protobuf"),
+                )
+                response.raise_for_status()
+
+        return trace_id_hex
+
+    def log_label(self, trace_id: str, label: Any) -> None:
+        """Log ground truth label for a previous prediction (non-blocking).
+
+        Use the trace_id returned from log_prediction() to correlate
+        the ground truth with the original prediction.
+
+        Args:
+            trace_id: The trace_id returned from log_prediction().
+            label: The actual outcome/ground truth value.
+        """
+        update = LabelUpdate(trace_id=trace_id, label=label)
+
+        if self.enable_background:
+            with self._queue_lock:
+                self._label_queue.append(update)
+        else:
+            # Immediate mode: build and send synchronously
+            # Import here to avoid loading protobuf at module level
+            from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+                ExportTraceServiceRequest,
+            )
+            from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+            from opentelemetry.proto.trace.v1.trace_pb2 import (
+                ResourceSpans,
+                ScopeSpans,
+                Span,
+            )
+
+            now_ns = time.time_ns()
+            trace_id_bytes = bytes.fromhex(trace_id)
+            span_id = self._generate_span_id()
+
+            span = Span(
+                trace_id=trace_id_bytes,
+                span_id=span_id,
+                name="label_update",
+                start_time_unix_nano=now_ns,
+                end_time_unix_nano=now_ns,
+                attributes=[
+                    KeyValue(
+                        key="ml.label", value=AnyValue(string_value=json.dumps(label))
+                    ),
+                ],
+            )
+
+            request = ExportTraceServiceRequest(
+                resource_spans=[ResourceSpans(scope_spans=[ScopeSpans(spans=[span])])]
+            )
+
+            payload = request.SerializeToString()
+
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(
+                    f"{self.endpoint}/v1/traces",
+                    content=payload,
+                    headers=self._build_headers("application/x-protobuf"),
+                )
                 response.raise_for_status()
 
     def flush(self) -> None:
-        """Force immediate flush of queued predictions (blocking).
+        """Force immediate flush of queued predictions and labels (blocking).
 
-        Useful for ensuring predictions are sent before shutdown or in tests.
+        Useful for ensuring data is sent before shutdown or in tests.
         """
-        if not self.enable_background or not self._loop:
-            return
-
-        # Run flush in the worker's event loop
-        future = asyncio.run_coroutine_threadsafe(
-            self._flush_queue_sync(),
-            self._loop
-        )
-        future.result(timeout=self.timeout)
-
-    async def _flush_queue_sync(self) -> None:
-        """Helper to flush queue from external thread."""
-        async with httpx.AsyncClient(
-            base_url=self.endpoint,
-            timeout=self.timeout,
-            headers=self._build_headers(),
-        ) as client:
-            await self._flush_queue(client)
+        self._flush_predictions()
+        self._flush_labels()
 
     def health(self) -> bool:
         """Check if the API is healthy.
@@ -198,19 +439,19 @@ class AitherClient:
         Returns:
             True if the API is healthy.
         """
-        with httpx.Client(base_url=self.endpoint, timeout=self.timeout) as client:
-            response = client.get("/health")
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.get(f"{self.endpoint}/health")
             return response.status_code == 200
 
     def close(self) -> None:
-        """Close the client and flush remaining predictions."""
+        """Close the client and flush remaining data."""
         if not self.enable_background:
             return
 
         # Signal worker to stop
         self._stop_event.set()
 
-        # Flush any remaining predictions
+        # Flush any remaining data
         try:
             self.flush()
         except Exception:

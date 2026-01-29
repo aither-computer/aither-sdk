@@ -4,11 +4,11 @@ Python SDK for the [Aither](https://aither.computer) platform - contextual intel
 
 ## Features
 
+- **OTLP Native**: Uses OpenTelemetry Protocol for efficient, standardized data transfer
 - **Non-blocking**: Predictions are logged asynchronously without blocking your application
 - **Automatic batching**: Multiple predictions are sent in batches for efficiency
+- **Label correlation**: Track ground truth labels with trace ID correlation
 - **Zero latency impact**: Background worker handles all API communication
-- **Simple API**: Synchronous interface hides async complexity
-- **Automatic flushing**: Graceful shutdown ensures no predictions are lost
 
 ## Installation
 
@@ -22,18 +22,17 @@ pip install aither
 import aither
 
 # Initialize with your API key
-aither.init(api_key="ak_your_api_key")
+aither.init(api_key="aith_your_api_key")
 
-# Log predictions - returns immediately without blocking!
-aither.log_prediction(
-    model_id="churn-classifier-v2",
-    prediction=0.73,
-    features={"tenure": 24, "monthly_charges": 65.5},
-    metadata={"user_id": "u_123"}
+# Log a prediction - returns trace_id for label correlation
+trace_id = aither.log_prediction(
+    model_name="fraud_detector",
+    features={"amount": 150.0, "country": "US"},
+    prediction=0.87,
 )
 
-# Predictions are queued and sent in the background
-# Your code continues instantly - zero latency impact!
+# Later, when you know the ground truth:
+aither.log_label(trace_id=trace_id, label=1)  # Was actually fraud
 ```
 
 ## Configuration
@@ -41,7 +40,7 @@ aither.log_prediction(
 ### Environment Variables
 
 ```bash
-export AITHER_API_KEY="ak_your_api_key"
+export AITHER_API_KEY="aith_your_api_key"
 export AITHER_ENDPOINT="https://aither.computer"  # optional
 ```
 
@@ -51,8 +50,10 @@ export AITHER_ENDPOINT="https://aither.computer"  # optional
 import aither
 
 aither.init(
-    api_key="ak_your_api_key",
-    endpoint="https://aither.computer"
+    api_key="aith_your_api_key",
+    endpoint="https://aither.computer",
+    flush_interval=1.0,  # seconds between flushes
+    batch_size=100,      # max predictions per batch
 )
 ```
 
@@ -64,75 +65,107 @@ Initialize the global client.
 
 - `api_key`: Your Aither API key (or set `AITHER_API_KEY` env var)
 - `endpoint`: API endpoint URL (default: `https://aither.computer`)
-- `flush_interval`: How often to flush queued predictions in seconds (default: 1.0)
-- `batch_size`: Maximum predictions per batch request (default: 100)
+- `flush_interval`: How often to flush queued predictions in seconds
+- `batch_size`: Maximum predictions per batch request
 
-### `aither.log_prediction(model_id, prediction, features=None, metadata=None)`
+### `aither.log_prediction(...) -> str`
 
-Log a model prediction (non-blocking).
+Log a model prediction (non-blocking). Returns a trace_id for label correlation.
 
-- `model_id`: Identifier for your model (e.g., "churn-classifier-v2")
-- `prediction`: The prediction value (float, int, str, or dict)
-- `features`: Dictionary of input features (optional)
-- `metadata`: Additional context (optional)
+```python
+trace_id = aither.log_prediction(
+    model_name="fraud_detector",           # Required: model identifier
+    features={"amount": 150.0},            # Required: input features
+    prediction=0.87,                       # Required: prediction value
+    # Optional parameters:
+    version="1.2.3",                       # Model version
+    probabilities=[0.13, 0.87],            # Class probabilities
+    classes=["legit", "fraud"],            # Class labels
+    environment="production",              # Deployment environment
+    request_id="req-abc123",               # Request identifier
+    user_id="user-anonymized-hash",        # User identifier (anonymized)
+)
+```
 
-**Returns immediately** - prediction is queued and sent in the background.
+**Returns**: `trace_id` (hex string) for correlating ground truth labels.
+
+### `aither.log_label(trace_id, label)`
+
+Log ground truth for a previous prediction (non-blocking).
+
+```python
+aither.log_label(
+    trace_id=trace_id,  # From log_prediction()
+    label=1,            # Actual outcome
+)
+```
 
 ### `aither.flush()`
 
-Force immediate flush of all queued predictions (blocking).
-
-Useful for:
-- Ensuring predictions are sent before shutdown
-- Testing
-- End of batch processing
+Force immediate flush of all queued data (blocking).
 
 ```python
-aither.log_prediction(model_id="my-model", prediction=0.5)
-aither.flush()  # Wait for all predictions to be sent
+aither.log_prediction(model_name="my-model", features={}, prediction=0.5)
+aither.flush()  # Wait for all data to be sent
 ```
 
 ### `aither.close()`
 
-Close the global client and flush remaining predictions.
-
-Called automatically on program exit via `atexit`, but you can call it explicitly:
+Close the global client and flush remaining data.
 
 ```python
 aither.close()  # Flush and shutdown background worker
 ```
 
-### `AitherClient`
+## Usage Patterns
 
-For more control, use the client class directly:
+### Basic Prediction Logging
 
 ```python
-from aither import AitherClient
+import aither
 
-# With async background worker (default)
-client = AitherClient(
-    api_key="ak_your_api_key",
-    flush_interval=1.0,
-    batch_size=100
+aither.init(api_key="aith_...")
+
+# Log prediction, get trace_id
+trace_id = aither.log_prediction(
+    model_name="churn_predictor",
+    features={"tenure": 24, "monthly_charges": 65.5},
+    prediction=0.73,
 )
 
-# Immediate mode (blocking, no background worker)
-client = AitherClient(
-    api_key="ak_your_api_key",
-    enable_background=False  # Send immediately, useful for debugging
-)
-
-client.log_prediction(model_id="my-model", prediction=0.5)
-client.close()  # Always close when done
+# Store trace_id with your prediction for later label correlation
+save_to_database(prediction_id, trace_id)
 ```
 
-## FastAPI Integration
+### Ground Truth Correlation
+
+```python
+# Later, when ground truth is known:
+trace_id = get_trace_id_from_database(prediction_id)
+aither.log_label(trace_id=trace_id, label="churned")
+```
+
+### Classification with Probabilities
+
+```python
+trace_id = aither.log_prediction(
+    model_name="sentiment_classifier",
+    features={"text": "Great product!"},
+    prediction="positive",
+    probabilities=[0.05, 0.15, 0.80],
+    classes=["negative", "neutral", "positive"],
+    version="2.1.0",
+    environment="production",
+)
+```
+
+### FastAPI Integration
 
 ```python
 import aither
 from fastapi import FastAPI
 
-aither.init(api_key="ak_your_api_key")
+aither.init(api_key="aith_...")
 app = FastAPI()
 
 @app.post("/predict")
@@ -140,20 +173,65 @@ async def predict(data: dict):
     prediction = model.predict(data)
 
     # Non-blocking - returns instantly
-    aither.log_prediction(
-        model_id="my-model",
+    trace_id = aither.log_prediction(
+        model_name="my-model",
+        features=data,
         prediction=prediction,
-        features=data
     )
 
-    return {"prediction": prediction}
+    return {"prediction": prediction, "trace_id": trace_id}
+
+@app.post("/label")
+async def label(trace_id: str, actual: int):
+    aither.log_label(trace_id=trace_id, label=actual)
+    return {"status": "ok"}
 
 @app.on_event("shutdown")
 async def shutdown():
-    aither.close()  # Flush remaining predictions
+    aither.close()  # Flush remaining data
 ```
 
-See `examples/fastapi_example.py` for a complete example.
+### Using the Client Directly
+
+```python
+from aither import AitherClient
+
+# With background worker (default)
+client = AitherClient(
+    api_key="aith_...",
+    flush_interval=1.0,
+    batch_size=100,
+)
+
+trace_id = client.log_prediction(
+    model_name="my-model",
+    features={"x": 1},
+    prediction=0.5,
+)
+client.log_label(trace_id=trace_id, label=1)
+client.close()
+
+# Immediate mode (blocking, no background worker)
+with AitherClient(api_key="aith_...", enable_background=False) as client:
+    client.log_prediction(...)  # Sends immediately
+```
+
+## Data Format
+
+The SDK uses OTLP (OpenTelemetry Protocol) to send predictions as spans with `ml.*` attributes:
+
+| Attribute | Description |
+|-----------|-------------|
+| `ml.model.name` | Model identifier |
+| `ml.model.version` | Model version |
+| `ml.features` | JSON-encoded input features |
+| `ml.prediction` | JSON-encoded prediction value |
+| `ml.prediction.probabilities` | Class probabilities |
+| `ml.prediction.classes` | Class labels |
+| `ml.label` | Ground truth value |
+| `ml.environment` | Deployment environment |
+| `ml.request_id` | Request identifier |
+| `ml.user_id` | User identifier |
 
 ## License
 
