@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import functools
 import threading
-import warnings
 from typing import Any, Callable, TypeVar
 
-from aither.client import AitherClient, Stats, UsageInfo
+from aither.client import AitherClient, BatchContext, Stats, TraceContext, UsageInfo
 from aither.management import APIKeysNamespace, OrgNamespace, UserNamespace
 from aither.models import APIKey, APIKeyWithSecret, Organization, UsageStats, User
 
@@ -15,7 +14,9 @@ __version__ = "0.2.0"
 __all__ = [
     # Client
     "AitherClient",
+    "BatchContext",
     "Stats",
+    "TraceContext",
     "UsageInfo",
     # Models
     "APIKey",
@@ -31,6 +32,8 @@ __all__ = [
     "flush",
     "close",
     "track",
+    "trace",
+    "batch",
     "last_trace_id",
     "stats",
     "usage_info",
@@ -50,7 +53,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def init(
     api_key: str | None = None,
-    endpoint: str | None = None,
+    base_url: str | None = None,
+    endpoint: str | None = None,  # Alias for base_url (backwards compat)
     flush_interval: float = 1.0,
     batch_size: int = 100,
     max_queue_size: int = 10_000,
@@ -62,7 +66,8 @@ def init(
 
     Args:
         api_key: API key for authentication. Falls back to AITHER_API_KEY env var.
-        endpoint: API endpoint URL. Falls back to AITHER_ENDPOINT env var or default.
+        base_url: API base URL. Falls back to AITHER_BASE_URL env var or default.
+        endpoint: Alias for base_url (backwards compatibility).
         flush_interval: How often to flush queued predictions (seconds).
         batch_size: Maximum predictions per batch request.
         max_queue_size: Maximum items in queue before dropping oldest.
@@ -73,6 +78,7 @@ def init(
     global _client
     _client = AitherClient(
         api_key=api_key,
+        base_url=base_url,
         endpoint=endpoint,
         flush_interval=flush_interval,
         batch_size=batch_size,
@@ -85,7 +91,8 @@ def init(
 
 def configure(
     api_key: str | None = None,
-    endpoint: str | None = None,
+    base_url: str | None = None,
+    endpoint: str | None = None,  # Alias for base_url (backwards compat)
     flush_interval: float = 1.0,
     batch_size: int = 100,
     max_queue_size: int = 10_000,
@@ -99,7 +106,8 @@ def configure(
 
     Args:
         api_key: API key for authentication. Falls back to AITHER_API_KEY env var.
-        endpoint: API endpoint URL. Falls back to AITHER_ENDPOINT env var or default.
+        base_url: API base URL. Falls back to AITHER_BASE_URL env var or default.
+        endpoint: Alias for base_url (backwards compatibility).
         flush_interval: How often to flush queued predictions (seconds).
         batch_size: Maximum predictions per batch request.
         max_queue_size: Maximum items in queue before dropping oldest.
@@ -119,6 +127,7 @@ def configure(
     """
     init(
         api_key=api_key,
+        base_url=base_url,
         endpoint=endpoint,
         flush_interval=flush_interval,
         batch_size=batch_size,
@@ -334,6 +343,49 @@ def track(
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def batch() -> BatchContext:
+    """Create a batch context for high-throughput logging.
+
+    Usage:
+        with aither.batch() as batch:
+            for item in dataset:
+                output = model.predict(item)
+                batch.log(model_name="classifier", features=item, prediction=output)
+        # Sends on context exit
+        # Access trace_ids for label correlation
+        trace_ids = batch.trace_ids
+
+    Returns:
+        BatchContext that can be used as a context manager.
+    """
+    return _get_client().batch()
+
+
+def trace(
+    model_name: str,
+    *,
+    version: str | None = None,
+    environment: str | None = None,
+) -> TraceContext:
+    """Create a trace context for dynamic model names.
+
+    Usage:
+        with aither.trace("model_" + version) as t:
+            prediction = model.predict(features)
+            t.log(features=features, prediction=prediction)
+            # t.trace_id available for label correlation
+
+    Args:
+        model_name: Identifier for the model.
+        version: Model version string.
+        environment: Deployment environment.
+
+    Returns:
+        TraceContext that can be used as a context manager.
+    """
+    return _get_client().trace(model_name, version=version, environment=environment)
 
 
 # Management namespaces - lazy proxy to global client
