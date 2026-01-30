@@ -4,11 +4,11 @@ Python SDK for the [aither](https://aither.computer) platform - contextual intel
 
 ## Features
 
-- **OTLP Native**: Uses OpenTelemetry Protocol for efficient, standardized data transfer
-- **Non-blocking**: Predictions are logged asynchronously without blocking your application
-- **Automatic batching**: Multiple predictions are sent in batches for efficiency
-- **Label correlation**: Track ground truth labels with trace ID correlation
-- **Zero latency impact**: Background worker handles all API communication
+- **Zero-code logging**: Wrap any model and predictions are logged automatically
+- **Framework support**: sklearn, pytorch, tensorflow, tinygrad, transformers
+- **Smart sampling**: Captures sample + metadata from features (never blocks inference)
+- **Label correlation**: Track ground truth with trace ID correlation
+- **Non-blocking**: Background worker handles all API communication
 
 ## Installation
 
@@ -20,20 +20,35 @@ pip install aither
 
 ```python
 import aither
+from sklearn.ensemble import RandomForestClassifier
 
-# Initialize with your API key
-aither.init(api_key="aith_your_api_key")
+# Initialize
+aither.init()  # Uses AITHER_API_KEY env var
 
-# Log a prediction - returns trace_id for label correlation
-trace_id = aither.log_prediction(
-    model_name="fraud_detector",
-    features={"amount": 150.0, "country": "US"},
-    prediction=0.87,
-)
+# Train your model
+model = RandomForestClassifier().fit(X_train, y_train)
 
-# Later, when you know the ground truth:
-aither.log_label(trace_id=trace_id, label=1)  # Was actually fraud
+# Wrap it - predictions are now logged automatically
+tracked = aither.wrap(model, name="fraud_detector")
+
+# Use normally
+predictions = tracked.predict(X_test)
+
+# Get trace_id for label correlation
+trace_id = tracked.last_trace_id
 ```
+
+## Supported Frameworks
+
+| Framework | Example |
+|-----------|---------|
+| **sklearn** | `aither.wrap(RandomForestClassifier(), name="clf")` |
+| **pytorch** | `aither.wrap(MyNet(), name="net")` |
+| **tensorflow** | `aither.wrap(keras_model, name="tf_model")` |
+| **tinygrad** | `aither.wrap(tinygrad_model, name="tiny")` |
+| **transformers** | `aither.wrap(pipeline("sentiment"), name="sentiment")` |
+
+Also works with sklearn-compatible libraries: xgboost, lightgbm, catboost.
 
 ## Configuration
 
@@ -41,122 +56,176 @@ aither.log_label(trace_id=trace_id, label=1)  # Was actually fraud
 
 ```bash
 export AITHER_API_KEY="aith_your_api_key"
-export AITHER_ENDPOINT="https://aither.computer"  # optional
+export AITHER_BASE_URL="https://aither.computer"  # optional
 ```
 
 ### Explicit Initialization
 
 ```python
-import aither
-
 aither.init(
     api_key="aith_your_api_key",
-    endpoint="https://aither.computer",
-    flush_interval=1.0,  # seconds between flushes
-    batch_size=100,      # max predictions per batch
+    base_url="https://aither.computer",
+    flush_interval=1.0,
+    batch_size=100,
 )
 ```
 
 ## API Reference
 
-### `aither.init(api_key=None, endpoint=None, flush_interval=1.0, batch_size=100)`
+### `aither.wrap(model, name, **options)` - Recommended
 
-Initialize the global client.
+Wrap a model for automatic prediction logging.
 
-- `api_key`: Your Aither API key (or set `AITHER_API_KEY` env var)
-- `endpoint`: API endpoint URL (default: `https://aither.computer`)
-- `flush_interval`: How often to flush queued predictions in seconds
-- `batch_size`: Maximum predictions per batch request
+```python
+tracked = aither.wrap(
+    model,                          # Any ML model
+    name="fraud_detector",          # Required: model identifier
+    version="1.2.3",                # Optional: model version
+    environment="production",       # Optional: deployment env
+    sample_rows=5,                  # Max rows to sample (default: 5)
+    sample_columns=10,              # Max columns to sample (default: 10)
+    features_fn=custom_extractor,   # Custom feature extraction
+)
 
-### `aither.log_prediction(...) -> str`
+# Use the wrapped model normally
+result = tracked.predict(X)
+result = tracked(X)                 # Also works
+probs = tracked.predict_proba(X)    # Also tracked
 
-Log a model prediction (non-blocking). Returns a trace_id for label correlation.
+# Access trace_id for label correlation
+trace_id = tracked.last_trace_id
+all_trace_ids = tracked.trace_ids   # All predictions
+
+# Access underlying model
+tracked.model                       # Original model
+tracked.classes_                    # Passthrough to model attributes
+```
+
+### `aither.log_prediction(...)` - Manual Control
+
+For custom pipelines or when you need full control:
 
 ```python
 trace_id = aither.log_prediction(
-    model_name="fraud_detector",           # Required: model identifier
-    features={"amount": 150.0},            # Required: input features
-    prediction=0.87,                       # Required: prediction value
-    # Optional parameters:
-    version="1.2.3",                       # Model version
-    probabilities=[0.13, 0.87],            # Class probabilities
-    classes=["legit", "fraud"],            # Class labels
-    environment="production",              # Deployment environment
-    request_id="req-abc123",               # Request identifier
-    user_id="user-anonymized-hash",        # User identifier (anonymized)
+    model_name="my_pipeline",
+    features={"amount": 150.0, "country": "US"},
+    prediction=0.87,
+    version="1.2.3",
+    environment="production",
 )
 ```
-
-**Returns**: `trace_id` (hex string) for correlating ground truth labels.
 
 ### `aither.log_label(trace_id, label)`
 
-Log ground truth for a previous prediction (non-blocking).
+Log ground truth for a prediction:
 
 ```python
-aither.log_label(
-    trace_id=trace_id,  # From log_prediction()
-    label=1,            # Actual outcome
-)
+aither.log_label(trace_id=trace_id, label=1)
 ```
 
-### `aither.flush()`
+### `@aither.track(name)` - Decorator
 
-Force immediate flush of all queued data (blocking).
+For functions instead of model objects:
 
 ```python
-aither.log_prediction(model_name="my-model", features={}, prediction=0.5)
-aither.flush()  # Wait for all data to be sent
+@aither.track("my_function")
+def predict(features):
+    return model.predict(features)
+
+result = predict(X)
+trace_id = aither.last_trace_id()
 ```
 
-### `aither.close()`
+## Feature Extraction
 
-Close the global client and flush remaining data.
+Wrapped models automatically extract features with smart sampling:
 
 ```python
-aither.close()  # Flush and shutdown background worker
+# Input: pandas DataFrame with 50,000 rows, 100 columns
+# What gets logged:
+{
+    "sample": [
+        {"col1": 1.5, "col2": "A", ...},  # 5 rows
+        ...
+    ],
+    "_meta": {
+        "type": "pandas.DataFrame",
+        "shape": [50000, 100],
+        "columns": ["col1", "col2", ...],
+        "dtypes": {"col1": "float64", ...},
+        "truncated": True
+    }
+}
+```
+
+**Supported types:**
+- numpy arrays
+- pandas DataFrames/Series
+- polars DataFrames/Series
+- torch Tensors
+- tensorflow Tensors
+- dicts (common in transformers)
+- lists
+
+**Custom extraction:**
+
+```python
+def my_extractor(X):
+    return {"shape": X.shape, "mean": X.mean()}
+
+tracked = aither.wrap(model, name="m", features_fn=my_extractor)
 ```
 
 ## Usage Patterns
 
-### Basic Prediction Logging
+### Basic Model Wrapping
 
 ```python
 import aither
+from sklearn.ensemble import RandomForestClassifier
 
-aither.init(api_key="aith_...")
+aither.init()
 
-# Log prediction, get trace_id
-trace_id = aither.log_prediction(
-    model_name="churn_predictor",
-    features={"tenure": 24, "monthly_charges": 65.5},
-    prediction=0.73,
-)
+model = RandomForestClassifier().fit(X_train, y_train)
+tracked = aither.wrap(model, name="churn_predictor", version="1.0")
 
-# Store trace_id with your prediction for later label correlation
-save_to_database(prediction_id, trace_id)
+predictions = tracked.predict(X_test)
+```
+
+### PyTorch Model
+
+```python
+import aither
+import torch
+
+aither.init()
+
+class MyNet(torch.nn.Module):
+    def forward(self, x):
+        return self.layers(x)
+
+model = MyNet()
+tracked = aither.wrap(model, name="my_net")
+
+# Both work:
+output = tracked(input_tensor)
+output = tracked.predict(input_tensor)
 ```
 
 ### Ground Truth Correlation
 
 ```python
-# Later, when ground truth is known:
-trace_id = get_trace_id_from_database(prediction_id)
-aither.log_label(trace_id=trace_id, label="churned")
-```
+# At prediction time
+predictions = tracked.predict(X)
+trace_ids = tracked.trace_ids  # List of all trace IDs
 
-### Classification with Probabilities
+# Store trace_ids with your predictions
+save_to_db(prediction_ids, trace_ids)
 
-```python
-trace_id = aither.log_prediction(
-    model_name="sentiment_classifier",
-    features={"text": "Great product!"},
-    prediction="positive",
-    probabilities=[0.05, 0.15, 0.80],
-    classes=["negative", "neutral", "positive"],
-    version="2.1.0",
-    environment="production",
-)
+# Later, when ground truth is known
+for pred_id, trace_id in load_from_db():
+    actual = get_actual_outcome(pred_id)
+    aither.log_label(trace_id, actual)
 ```
 
 ### FastAPI Integration
@@ -165,55 +234,26 @@ trace_id = aither.log_prediction(
 import aither
 from fastapi import FastAPI
 
-aither.init(api_key="aith_...")
+aither.init()
+model = aither.wrap(load_model(), name="api_model")
 app = FastAPI()
 
 @app.post("/predict")
 async def predict(data: dict):
     prediction = model.predict(data)
-
-    # Non-blocking - returns instantly
-    trace_id = aither.log_prediction(
-        model_name="my-model",
-        features=data,
-        prediction=prediction,
-    )
-
-    return {"prediction": prediction, "trace_id": trace_id}
+    return {
+        "prediction": prediction,
+        "trace_id": model.last_trace_id
+    }
 
 @app.post("/label")
 async def label(trace_id: str, actual: int):
-    aither.log_label(trace_id=trace_id, label=actual)
+    aither.log_label(trace_id, actual)
     return {"status": "ok"}
 
 @app.on_event("shutdown")
 async def shutdown():
-    aither.close()  # Flush remaining data
-```
-
-### Using the Client Directly
-
-```python
-from aither import AitherClient
-
-# With background worker (default)
-client = AitherClient(
-    api_key="aith_...",
-    flush_interval=1.0,
-    batch_size=100,
-)
-
-trace_id = client.log_prediction(
-    model_name="my-model",
-    features={"x": 1},
-    prediction=0.5,
-)
-client.log_label(trace_id=trace_id, label=1)
-client.close()
-
-# Immediate mode (blocking, no background worker)
-with AitherClient(api_key="aith_...", enable_background=False) as client:
-    client.log_prediction(...)  # Sends immediately
+    aither.close()
 ```
 
 ## Data Format
@@ -224,14 +264,10 @@ The SDK uses OTLP (OpenTelemetry Protocol) to send predictions as spans with `ml
 |-----------|-------------|
 | `ml.model.name` | Model identifier |
 | `ml.model.version` | Model version |
-| `ml.features` | JSON-encoded input features |
-| `ml.prediction` | JSON-encoded prediction value |
-| `ml.prediction.probabilities` | Class probabilities |
-| `ml.prediction.classes` | Class labels |
+| `ml.features` | JSON-encoded feature sample + metadata |
+| `ml.prediction` | JSON-encoded prediction |
 | `ml.label` | Ground truth value |
 | `ml.environment` | Deployment environment |
-| `ml.request_id` | Request identifier |
-| `ml.user_id` | User identifier |
 
 ## License
 

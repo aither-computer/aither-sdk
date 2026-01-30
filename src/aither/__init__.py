@@ -7,8 +7,10 @@ import threading
 from typing import Any, Callable, TypeVar
 
 from aither.client import AitherClient, BatchContext, Stats, TraceContext, UsageInfo
+from aither.extractors import ExtractionConfig, extract_features
 from aither.management import APIKeysNamespace, OrgNamespace, UserNamespace
 from aither.models import APIKey, APIKeyWithSecret, Organization, UsageStats, User
+from aither.wrapper import TrackedModel, wrap
 
 __version__ = "0.2.0"
 __all__ = [
@@ -18,6 +20,11 @@ __all__ = [
     "Stats",
     "TraceContext",
     "UsageInfo",
+    # Wrapper (primary API)
+    "wrap",
+    "TrackedModel",
+    "ExtractionConfig",
+    "extract_features",
     # Models
     "APIKey",
     "APIKeyWithSecret",
