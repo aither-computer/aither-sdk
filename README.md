@@ -256,6 +256,56 @@ async def shutdown():
     aither.close()
 ```
 
+## Management API
+
+The SDK provides namespaces for managing your organization, API keys, and user account.
+
+```python
+import aither
+
+aither.init()
+
+# Organization info
+org = aither.org.get()
+print(org.name, org.plan)
+
+# Usage stats for current billing period
+usage = aither.org.usage()
+print(f"API calls: {usage.api_calls}")
+
+# Current user
+me = aither.user.me()
+print(me.email)
+
+# API key management (requires admin scope)
+keys = aither.api_keys.list()
+new_key = aither.api_keys.create(name="Production", scopes=["read", "write"])
+aither.api_keys.revoke(key_id="...")
+```
+
+### Why `.get()` instead of direct attributes?
+
+You might wonder why `aither.org.get().name` instead of just `aither.org.name`. This is intentional:
+
+1. **Network calls are explicit** - `.get()` makes it clear you're making an HTTP request. Hidden network calls on attribute access would be surprising and expensive.
+
+2. **Caching semantics are clear** - The returned `Organization` is a point-in-time snapshot. You control when to refresh by calling `.get()` again.
+
+3. **Error handling is predictable** - Exceptions from HTTP failures occur at the `.get()` call site, not on attribute access.
+
+```python
+# Recommended: fetch once, use the snapshot
+org = aither.org.get()
+print(f"{org.name} on {org.plan} plan")
+
+# Compare states over time
+org_before = aither.org.get()
+# ... make changes ...
+org_after = aither.org.get()
+if org_before.plan != org_after.plan:
+    print("Plan changed!")
+```
+
 ## Data Format
 
 The SDK uses OTLP (OpenTelemetry Protocol) to send predictions as spans with `ml.*` attributes:

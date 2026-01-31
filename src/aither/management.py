@@ -12,6 +12,14 @@ if TYPE_CHECKING:
     from aither.client import AitherClient
 
 
+def _update_usage_from_response(
+    client: "AitherClient", response: httpx.Response
+) -> None:
+    """Parse rate limit headers and update client usage info."""
+    # Reuse the client's existing header parsing logic
+    client._parse_rate_limit_headers(response)
+
+
 class APIKeysNamespace:
     """Namespace for API key management operations.
 
@@ -45,6 +53,7 @@ class APIKeysNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
         return [APIKey(**key) for key in response.json()]
 
     def create(
@@ -82,6 +91,7 @@ class APIKeysNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
         return APIKeyWithSecret(**response.json())
 
     def revoke(self, key_id: str) -> None:
@@ -102,6 +112,7 @@ class APIKeysNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
 
 
 class OrgNamespace:
@@ -134,6 +145,7 @@ class OrgNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
         return Organization(**response.json())
 
     def usage(self) -> UsageStats:
@@ -152,6 +164,7 @@ class OrgNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
         return UsageStats(**response.json())
 
 
@@ -184,4 +197,5 @@ class UserNamespace:
             timeout=client.timeout,
         )
         response.raise_for_status()
+        _update_usage_from_response(client, response)
         return User(**response.json())
