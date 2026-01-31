@@ -158,6 +158,7 @@ def log_prediction(
     features: dict[str, Any],
     prediction: Any,
     *,
+    project: str | None = None,
     version: str | None = None,
     probabilities: list[float] | None = None,
     classes: list[str] | None = None,
@@ -170,10 +171,21 @@ def log_prediction(
     Predictions are queued and sent asynchronously using OTLP format.
     Returns a trace_id that can be used to correlate ground truth labels.
 
+    Model Namespacing:
+        Models can be organized under projects using "project/model" format.
+        This creates a hierarchy in the dashboard for better organization.
+
+        Two ways to specify namespaced models:
+        1. Direct: model_name="payments/fraud_detector"
+        2. Separate args: model_name="fraud_detector", project="payments"
+
     Args:
-        model_name: Identifier for the model (e.g., "fraud_detector").
+        model_name: Identifier for the model. Can include project prefix
+            (e.g., "fraud_detector" or "payments/fraud_detector").
         features: Input features used for the prediction.
         prediction: The prediction value.
+        project: Optional project namespace. If provided, model_name becomes
+            "project/model_name". Ignored if model_name already contains "/".
         version: Model version (e.g., "1.2.3", git sha).
         probabilities: Class probabilities (for classification).
         classes: Class labels corresponding to probabilities.
@@ -183,9 +195,24 @@ def log_prediction(
 
     Returns:
         trace_id: Hex-encoded trace ID for label correlation.
+
+    Example:
+        # Simple model (no namespace)
+        aither.log_prediction("fraud_detector", features, prediction)
+
+        # Namespaced model (direct format)
+        aither.log_prediction("payments/fraud_detector", features, prediction)
+
+        # Namespaced model (using project parameter)
+        aither.log_prediction("fraud_detector", features, prediction, project="payments")
     """
+    # Apply project namespace if provided and model_name doesn't already have one
+    effective_model_name = model_name
+    if project and "/" not in model_name:
+        effective_model_name = f"{project}/{model_name}"
+
     return _get_client().log_prediction(
-        model_name=model_name,
+        model_name=effective_model_name,
         features=features,
         prediction=prediction,
         version=version,
@@ -270,6 +297,7 @@ def last_trace_id() -> str | None:
 def track(
     model_name: str,
     *,
+    project: str | None = None,
     features_arg: str | None = None,
     prediction_key: str | None = None,
     version: str | None = None,
@@ -281,8 +309,15 @@ def track(
     return value as prediction. Use features_arg and prediction_key for
     non-standard signatures.
 
+    Model Namespacing:
+        Models can be organized under projects using "project/model" format.
+        Use the project parameter or include the project in model_name directly.
+
     Args:
-        model_name: Identifier for the model (e.g., "fraud_detector").
+        model_name: Identifier for the model. Can include project prefix
+            (e.g., "fraud_detector" or "payments/fraud_detector").
+        project: Optional project namespace. If provided, model_name becomes
+            "project/model_name". Ignored if model_name already contains "/".
         features_arg: Name of the argument to use as features (default: first positional).
         prediction_key: Key to extract from return dict as prediction (default: entire return).
         version: Model version string.
@@ -292,13 +327,23 @@ def track(
         Decorated function that logs predictions automatically.
 
     Example:
+        # Simple model
         @aither.track("fraud_detector")
+        def predict(features):
+            return model.predict(features)
+
+        # Namespaced model
+        @aither.track("fraud_detector", project="payments")
         def predict(features):
             return model.predict(features)
 
         result = predict({"amount": 150.0})
         trace_id = aither.last_trace_id()
     """
+    # Apply project namespace if provided and model_name doesn't already have one
+    effective_model_name = model_name
+    if project and "/" not in model_name:
+        effective_model_name = f"{project}/{model_name}"
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
@@ -335,7 +380,7 @@ def track(
 
             # Log the prediction
             trace_id = _get_client().log_prediction(
-                model_name=model_name,
+                model_name=effective_model_name,
                 features=features,
                 prediction=prediction,
                 version=version,
@@ -373,10 +418,15 @@ def batch() -> BatchContext:
 def trace(
     model_name: str,
     *,
+    project: str | None = None,
     version: str | None = None,
     environment: str | None = None,
 ) -> TraceContext:
     """Create a trace context for dynamic model names.
+
+    Model Namespacing:
+        Models can be organized under projects using "project/model" format.
+        Use the project parameter or include the project in model_name directly.
 
     Usage:
         with aither.trace("model_" + version) as t:
@@ -384,15 +434,27 @@ def trace(
             t.log(features=features, prediction=prediction)
             # t.trace_id available for label correlation
 
+        # With project namespace
+        with aither.trace("fraud_detector", project="payments") as t:
+            t.log(features=features, prediction=prediction)
+
     Args:
-        model_name: Identifier for the model.
+        model_name: Identifier for the model. Can include project prefix
+            (e.g., "fraud_detector" or "payments/fraud_detector").
+        project: Optional project namespace. If provided, model_name becomes
+            "project/model_name". Ignored if model_name already contains "/".
         version: Model version string.
         environment: Deployment environment.
 
     Returns:
         TraceContext that can be used as a context manager.
     """
-    return _get_client().trace(model_name, version=version, environment=environment)
+    # Apply project namespace if provided and model_name doesn't already have one
+    effective_model_name = model_name
+    if project and "/" not in model_name:
+        effective_model_name = f"{project}/{model_name}"
+
+    return _get_client().trace(effective_model_name, version=version, environment=environment)
 
 
 # Management namespaces - lazy proxy to global client

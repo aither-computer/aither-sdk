@@ -95,6 +95,10 @@ class BatchContext:
                 batch.log(model_name="classifier", features=item, prediction=output)
         # trace_ids available after context exit
         trace_ids = batch.trace_ids
+
+        # With project namespace
+        with client.batch() as batch:
+            batch.log(model_name="fraud", features=item, prediction=output, project="payments")
     """
 
     _client: "AitherClient"
@@ -106,6 +110,7 @@ class BatchContext:
         features: dict[str, Any],
         prediction: Any,
         *,
+        project: str | None = None,
         version: str | None = None,
         probabilities: list[float] | None = None,
         classes: list[str] | None = None,
@@ -115,10 +120,30 @@ class BatchContext:
     ) -> str:
         """Log a prediction within the batch.
 
-        Returns trace_id and appends it to trace_ids list.
+        Args:
+            model_name: Identifier for the model. Can include project prefix
+                (e.g., "fraud_detector" or "payments/fraud_detector").
+            features: Input features used for the prediction.
+            prediction: The prediction value.
+            project: Optional project namespace. If provided, model_name becomes
+                "project/model_name". Ignored if model_name already contains "/".
+            version: Model version (e.g., "1.2.3", git sha).
+            probabilities: Class probabilities (for classification).
+            classes: Class labels corresponding to probabilities.
+            environment: Deployment environment (e.g., "production").
+            request_id: Unique request identifier.
+            user_id: User/customer identifier (anonymized).
+
+        Returns:
+            trace_id: Hex-encoded trace ID for label correlation. Also appended to trace_ids list.
         """
+        # Apply project namespace if provided and model_name doesn't already have one
+        effective_model_name = model_name
+        if project and "/" not in model_name:
+            effective_model_name = f"{project}/{model_name}"
+
         trace_id = self._client.log_prediction(
-            model_name=model_name,
+            model_name=effective_model_name,
             features=features,
             prediction=prediction,
             version=version,
@@ -143,11 +168,19 @@ class BatchContext:
 class TraceContext:
     """Context manager for dynamic model name tracing.
 
+    Model Namespacing:
+        Models can be organized under projects using "project/model" format.
+        Pass the project parameter when creating the trace context.
+
     Usage:
         with client.trace("model_" + version) as t:
             prediction = model.predict(features)
             t.log(features=features, prediction=prediction)
             # t.trace_id available for label correlation
+
+        # With project namespace
+        with client.trace("fraud_detector", project="payments") as t:
+            t.log(features=features, prediction=prediction)
     """
 
     _client: "AitherClient"
@@ -706,8 +739,14 @@ class AitherClient:
         Predictions are queued and sent asynchronously using OTLP format.
         Returns a trace_id that can be used to correlate ground truth labels.
 
+        Model Namespacing:
+            Models can be organized under projects using "project/model" format
+            in the model_name (e.g., "payments/fraud_detector"). The backend
+            automatically parses this and creates the project hierarchy.
+
         Args:
-            model_name: Identifier for the model (e.g., "fraud_detector").
+            model_name: Identifier for the model. Can include project prefix
+                (e.g., "fraud_detector" or "payments/fraud_detector").
             features: Input features used for the prediction.
             prediction: The prediction value.
             version: Model version (e.g., "1.2.3", git sha).
@@ -719,6 +758,13 @@ class AitherClient:
 
         Returns:
             trace_id: Hex-encoded trace ID for label correlation.
+
+        Example:
+            # Simple model
+            client.log_prediction("fraud_detector", features, prediction)
+
+            # Namespaced model (organized under "payments" project)
+            client.log_prediction("payments/fraud_detector", features, prediction)
         """
         trace_id = self._generate_trace_id()
         span_id = self._generate_span_id()
@@ -967,10 +1013,15 @@ class AitherClient:
         self,
         model_name: str,
         *,
+        project: str | None = None,
         version: str | None = None,
         environment: str | None = None,
     ) -> TraceContext:
         """Create a trace context for dynamic model names.
+
+        Model Namespacing:
+            Models can be organized under projects using "project/model" format.
+            Use the project parameter or include the project in model_name directly.
 
         Usage:
             with client.trace("model_" + version) as t:
@@ -978,17 +1029,29 @@ class AitherClient:
                 t.log(features=features, prediction=prediction)
                 # t.trace_id available for label correlation
 
+            # With project namespace
+            with client.trace("fraud_detector", project="payments") as t:
+                t.log(features=features, prediction=prediction)
+
         Args:
-            model_name: Identifier for the model.
+            model_name: Identifier for the model. Can include project prefix
+                (e.g., "fraud_detector" or "payments/fraud_detector").
+            project: Optional project namespace. If provided, model_name becomes
+                "project/model_name". Ignored if model_name already contains "/".
             version: Model version string.
             environment: Deployment environment.
 
         Returns:
             TraceContext that can be used as a context manager.
         """
+        # Apply project namespace if provided and model_name doesn't already have one
+        effective_model_name = model_name
+        if project and "/" not in model_name:
+            effective_model_name = f"{project}/{model_name}"
+
         return TraceContext(
             _client=self,
-            model_name=model_name,
+            model_name=effective_model_name,
             version=version,
             environment=environment,
         )
